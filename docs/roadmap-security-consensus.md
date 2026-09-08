@@ -1,4 +1,4 @@
-# Roadmap notes: TLS (shipped) and controller consensus
+# Roadmap notes: TLS and controller consensus (both shipped)
 
 Two design gaps assessed on 2026-07-19, alongside the batch that shipped
 producer-state expiry, cross-broker transactional produce, and cluster-wide
@@ -84,9 +84,35 @@ completing, so TLS must be woven into the event loop, not wrapped around it:
 integration tests (the current spec suite drives routes in-process and would
 not exercise the handshake paths at all).
 
-## Controller consensus (beyond epoch fencing)
+## Controller consensus (beyond epoch fencing) — SHIPPED
 
-**Status today:** `controller_fence.lua` is fencing, not consensus — a
+> **Update (2026-09-08). Shipped as `Server.Cluster.Raft`**, and essentially to
+> this scope: static membership from `Cluster.Peers`, a replicated log carrying
+> controller claims and partition ownership, the data path untouched.
+> `src/cluster/raft/` holds the store, the node state machine, the reactor
+> service and a `ControllerFence`-shaped adapter, so `cluster_server.lua` and
+> `balance_loop.lua` see the same interface whether consensus is on or off.
+> See [cluster.md](cluster.md).
+>
+> Three departures from the plan below:
+>
+> * **`assignments.lua` now records self-owned partitions** instead of treating
+>   "absent" as "mine". The sparse form was broker-relative, so a snapshot taken
+>   on b1 silently lost every partition b1 owned. Consensus needs the table to
+>   mean the same thing on every broker.
+> * **The RPC client is reactor-native**, not `socket.http`. The existing peer
+>   client blocks, which is tolerable once every 60 s in the balance loop and
+>   not at all tolerable at a 500 ms heartbeat with an unreachable peer.
+> * **Snapshotting was not optional.** The log is metadata-only but ownership
+>   changes are unbounded over a broker's life, so compaction plus a
+>   `/cluster/raft/snapshot` route came in with the first version rather than
+>   later.
+>
+> Still open: membership changes need a restart (no joint consensus), and the
+> group-coordinator liveness hints listed below were left out as the note
+> suggested.
+
+**Status when this was written:** `controller_fence.lua` is fencing, not consensus — a
 durable monotonic epoch, propagated on requests, refusing superseded
 controllers with 409. Split-brain is possible when two claimants act against
 disjoint reachable peers, and epoch-less requests bypass the fence.

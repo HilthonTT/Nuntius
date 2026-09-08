@@ -22,6 +22,10 @@ local Reassigner       = require("src.cluster.reassigner")
 local ClusterServer    = require("src.cluster.cluster_server")
 local BalanceLoop      = require("src.cluster.balance_loop")
 local ControllerFence  = require("src.cluster.controller_fence")
+local RaftStore        = require("src.cluster.raft.store")
+local RaftNode         = require("src.cluster.raft.node")
+local RaftService      = require("src.cluster.raft.service")
+local RaftFence        = require("src.cluster.raft.fence")
 local log              = require("src.log.logger").get("server")
 
 local ACKS_BY_NAME = {
@@ -118,6 +122,14 @@ function Server.new(opts)
         "Failed authentications, labelled by mechanism.")
     metrics.describe("moonmq_metrics_http_unauthorized_total", "counter",
         "Metrics-endpoint requests refused for missing or bad credentials.")
+    metrics.describe("moonmq_raft_term", "gauge",
+        "Current controller-consensus term on this broker.")
+    metrics.describe("moonmq_raft_is_controller", "gauge",
+        "1 when this broker is the elected controller, 0 otherwise.")
+    metrics.describe("moonmq_raft_commit_index", "gauge",
+        "Highest committed index in the controller metadata log.")
+    metrics.describe("moonmq_raft_elections_total", "counter",
+        "Controller elections this broker has started.")
     metrics.describe("moonmq_tls_handshakes_total", "counter",
         "Completed TLS handshakes across every listener.")
     metrics.describe("moonmq_tls_reloads_total", "counter",
@@ -156,13 +168,62 @@ function Server.new(opts)
         if not fence then return nil, ferr end
 
         local peers = {}
+        local addresses, tokens, member_ids = {}, {}, { cc.broker_id }
         for _, p in ipairs(cc.peers or {}) do
             peers[p.id] = Peer.new(p.id, p.address,
                 { token = p.token or cc.token, timeout = cc.peer_timeout,
                   tls = cc.tls })
+            addresses[p.id]  = p.address
+            tokens[p.id]     = p.token or cc.token
+            member_ids[#member_ids + 1] = p.id
         end
 
         broker.cluster_assignments = assignments
+
+        local raft_node, raft_service
+        local rf = cc.raft
+        if rf and rf.enabled ~= false then
+            local store, rerr = RaftStore.new(opts.data_dir)
+            if not store then return nil, rerr end
+
+            raft_node = RaftNode.new({
+                id              = cc.broker_id,
+                peers           = member_ids,
+                store           = store,
+                election_min    = rf.election_min,
+                election_max    = rf.election_max,
+                max_log_entries = rf.max_log_entries,
+                apply = function(entry)
+                    if entry.kind ~= RaftNode.KIND_OWNER then return true end
+                    local d = entry.data
+                    if type(d.topic) ~= "string" or type(d.partition) ~= "number"
+                       or type(d.owner) ~= "string" then
+                        return true
+                    end
+                    return assignments:set_owner(d.topic, d.partition, d.owner)
+                end,
+                snapshot = function()
+                    return { owners = assignments:entries() }
+                end,
+                restore = function(state)
+                    return assignments:replace(
+                        type(state) == "table" and state.owners or {})
+                end,
+            })
+
+            raft_service = RaftService.new({
+                node        = raft_node,
+                reactor     = reactor,
+                addresses   = addresses,
+                tokens      = tokens,
+                token       = cc.token,
+                tls         = cc.tls,
+                heartbeat_s = rf.heartbeat_s,
+                rpc_timeout = rf.rpc_timeout,
+                commit_wait = rf.commit_wait,
+            })
+            fence = RaftFence.new(raft_node)
+        end
 
         cluster = {
             broker_id   = cc.broker_id,
@@ -175,11 +236,18 @@ function Server.new(opts)
                 broker = broker, assignments = assignments, peers = peers,
                 self_id = cc.broker_id, reactor = reactor,
                 batch_bytes = cc.batch_bytes,
+                raft_commit = raft_service and function(topic, partition, owner)
+                    return raft_service:commit(RaftNode.KIND_OWNER, {
+                        topic = topic, partition = partition, owner = owner,
+                    })
+                end or nil,
             }),
             host  = cc.host or "127.0.0.1",
             port  = cc.port,
             token = cc.token,
             fence = fence,
+            raft  = raft_node,
+            raft_service = raft_service,
             server_tls = cc.server_tls,
         }
     end
@@ -546,9 +614,20 @@ function Server:start()
             token       = self.cluster.token,
             tls         = self.cluster.server_tls,
             fence       = self.cluster.fence,
+            raft        = self.cluster.raft,
             group_coordinator = self.coordinator,
         })
         cs:start()
+
+        if self.cluster.raft_service then
+            self.reactor:spawn(function()
+                self.cluster.raft_service:run(function() return self.running end)
+            end)
+            log:info("controller consensus: raft over %d member(s), "
+                .. "restored at term %d index %d",
+                self.cluster.raft:size(), self.cluster.raft:term(),
+                self.cluster.raft:last_index())
+        end
     end
 
     local ac = self.autobalance
@@ -563,6 +642,7 @@ function Server:start()
                 self_id     = self.cluster.broker_id,
                 reassigner  = self.cluster.reassigner,
                 fence       = self.cluster.fence,
+                raft        = self.cluster.raft,
                 interval_s  = ac.interval_s,
                 dry_run     = ac.dry_run,
                 goals       = ac.goals,

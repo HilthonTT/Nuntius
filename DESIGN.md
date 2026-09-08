@@ -58,6 +58,8 @@ src/
                    ConsumerGroup FSM, DLQ, transaction coordinator
   cluster/         multi-broker: ownership table, inter-broker HTTP + peer
                    client, partition reassigner, produce router, balance loop
+  cluster/raft/    controller consensus: persistent log store, node state
+                   machine, reactor-native RPC, replication service
   autobalancer/    pure decision engine: cluster model, windowed load samples,
                    distribution goals, anomaly detector
   storage/         topic/partition management + default "segmented" backend
@@ -241,7 +243,13 @@ Two orthogonal features, both statically configured:
   transactional produce works across brokers. See
   [docs/cluster.md](docs/cluster.md).
 
-TLS and controller consensus are scoped but not shipped —
+* **Controller consensus** (`src/cluster/raft/`, optional): a replicated log
+  over cluster *metadata* only — which broker is controller, which broker owns
+  which partition. It makes the epoch on `/cluster/*` requests a majority-agreed
+  Raft term instead of a local monotonic counter, and confines the balance loop
+  to the elected leader. The message log is never replicated through it.
+
+How both were scoped and where they landed:
 [docs/roadmap-security-consensus.md](docs/roadmap-security-consensus.md).
 
 ## Wire protocol

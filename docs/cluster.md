@@ -133,7 +133,9 @@ Under `Server` in `appsettings.json`:
                                     // port is reachable beyond loopback
   "Peers": [
     { "Id": "b2", "Address": "10.0.0.2:9095" }
-  ]
+  ],
+  "Raft": { "Enabled": true }   // majority-elected controller + replicated
+                                // ownership table; see below
 },
 "Autobalance": {
   "Enabled": true,                  // needs Cluster; run on ONE broker
@@ -146,6 +148,77 @@ Under `Server` in `appsettings.json`:
 Start with `DryRun: true` and watch the `balance_loop` log lines and the
 `moonmq_autobalancer_*` metrics until the plans look sane.
 
+## Controller consensus
+
+Without it, "who is the controller" is a monotonic epoch in a local file and
+"who owns which partition" is a last-writer-wins JSON file per broker. Both
+work while claims propagate; neither is agreement. `Cluster.Raft` replaces the
+pair with a small replicated log:
+
+```json
+"Cluster": {
+  "BrokerId": "b1",
+  "Port": 9095,
+  "Peers": [ { "Id": "b2", "Address": "10.0.0.2:9095" },
+             { "Id": "b3", "Address": "10.0.0.3:9095" } ],
+  "Raft": { "Enabled": true }
+}
+```
+
+Membership is the `Peers` list plus this broker — static, which is all a v1
+needs. The log carries two entry kinds:
+
+* **`controller`** — written by a broker the moment it wins an election. It is
+  both the claim and Raft's own no-op-in-current-term, which is what lets
+  entries from earlier terms commit safely.
+* **`owner`** — one partition ownership change. The reassigner proposes it and
+  waits for it to commit before draining the tail, so every broker learns the
+  new owner from the same log rather than from a point-to-point `POST`.
+
+**The data path is untouched.** Records still go to a single owner per
+partition; Raft only decides who that is. Raft-replicating the message log
+itself is a different project, and the AutoMQ-style architecture this codebase
+follows deliberately avoids it.
+
+Three routes carry it, on the existing cluster listener and behind the same
+`X-Cluster-Token` and `Cluster.Tls`: `/cluster/raft/vote`,
+`/cluster/raft/append`, `/cluster/raft/snapshot`. They are exempt from the
+epoch fence, because they are what establishes it. The RPC client is
+reactor-native (`src/cluster/raft/rpc.lua`) rather than blocking
+`socket.http` — at a 500 ms heartbeat, one unreachable peer must not stall the
+broker for the RPC timeout on every beat.
+
+Three things follow from turning it on:
+
+* **The balance loop only runs on the elected controller.** The other brokers
+  tick, see they are not leader, and do nothing. You no longer have to arrange
+  for `Autobalance` to be enabled on exactly one broker.
+* **The controller epoch on `/cluster/*` requests is the Raft term.** A
+  superseded controller is refused with 409 by every broker that has heard the
+  newer term — which, at one heartbeat, is every reachable one.
+* **A leader that loses contact with a majority steps down** within one
+  election timeout, so a partitioned-off controller stops acting instead of
+  acting alone.
+
+The log is compacted once it passes `MaxLogEntries`: the applied ownership
+table becomes a snapshot, the prefix is dropped, and a follower that has fallen
+behind the snapshot is caught up with `/cluster/raft/snapshot` instead of a
+replay.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `Enabled` | — | Omit the block entirely to keep epoch fencing |
+| `ElectionTimeoutMs` | 2500 | Lower bound; the upper bound is randomised from it |
+| `HeartbeatMs` | 500 | Leader → follower AppendEntries interval |
+| `RpcTimeoutMs` | 1000 | Per-RPC deadline |
+| `CommitTimeoutSeconds` | 10 | How long a proposal waits for a majority |
+| `MaxLogEntries` | 512 | Compaction threshold |
+
+State lives in `raft-state.json` beside `cluster-assignments.json`, fsynced
+before any vote or append is acknowledged. Deleting it makes a broker forget
+its term and vote, which is exactly the thing Raft assumes never happens —
+treat it as broker data, not as a cache.
+
 ## Metrics
 
 | Metric | Meaning |
@@ -156,6 +229,10 @@ Start with `DryRun: true` and watch the `balance_loop` log lines and the
 | `moonmq_reassign_partitions_total{dest}` | completed migrations |
 | `moonmq_reassign_bytes_total{dest}` | bytes migrated |
 | `moonmq_reassign_duration_seconds{topic}` | migration latency histogram |
+| `moonmq_raft_is_controller` | 1 on the elected controller, 0 elsewhere |
+| `moonmq_raft_term` | current consensus term |
+| `moonmq_raft_commit_index` | highest committed metadata index |
+| `moonmq_raft_elections_total` | elections this broker has started |
 
 ## Boundaries (read before enabling)
 
@@ -179,11 +256,13 @@ Start with `DryRun: true` and watch the `balance_loop` log lines and the
 * **Local data is left in place after a move.** The ownership table routes
   around it; reclaim disk by deleting the partition directory once you're
   satisfied.
-* **Controller fencing is not consensus.** A superseded balance loop is
-  refused wherever the newer claim has propagated, and requests without
-  epoch headers bypass the fence entirely. Two controllers claiming at the
-  same instant against disjoint reachable peers can both act until their
-  claims meet.
+* **Controller fencing is not consensus — unless `Raft` is on.** Without
+  `Cluster.Raft`, a superseded balance loop is refused wherever the newer
+  claim has propagated, requests without epoch headers bypass the fence
+  entirely, and two controllers claiming at the same instant against disjoint
+  reachable peers can both act until their claims meet. With `Cluster.Raft`
+  enabled the controller is elected by a majority and the ownership table is
+  a replicated log, which closes both windows.
 * **Transactional produce crosses brokers (2026-07-19), with one window.**
   A transactional record routed to a peer-owned partition enrols the owner
   first (`/cluster/txn/enroll` floors its LSO), forwards the record, and on

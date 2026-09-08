@@ -20,6 +20,7 @@ function BalanceLoop.new(opts)
         interval_s  = opts.interval_s or DEFAULT_INTERVAL_S,
         dry_run     = opts.dry_run or false,
         fence       = opts.fence,
+        raft        = opts.raft,
         controller_epoch = nil,
         fenced      = false,
         topic_refs  = {},
@@ -98,20 +99,37 @@ function BalanceLoop:_prune(seen)
     end
 end
 
+function BalanceLoop:_announce_controller(epoch)
+    if self.controller_epoch == epoch then return end
+    self.controller_epoch = epoch
+    for _, peer in pairs(self.peers) do
+        if peer.set_controller then peer:set_controller(epoch, self.self_id) end
+    end
+    log:info("acting as controller for epoch %d", epoch)
+end
+
 function BalanceLoop:_ensure_controller()
+    if self.raft then
+        if not self.raft:is_leader() then
+            if self.controller_epoch then
+                self.controller_epoch = nil
+                for _, peer in pairs(self.peers) do
+                    if peer.set_controller then peer:set_controller(nil) end
+                end
+            end
+            return nil, "not the raft controller; not acting"
+        end
+        self:_announce_controller(self.raft:term())
+        return true
+    end
+
     if not self.fence then return true end
     if self.fenced then return nil, "controller superseded; not acting" end
 
     if not self.controller_epoch then
         local epoch, cerr = self.fence:claim(self.self_id)
         if not epoch then return nil, cerr end
-        self.controller_epoch = epoch
-        for _, peer in pairs(self.peers) do
-            if peer.set_controller then
-                peer:set_controller(epoch, self.self_id)
-            end
-        end
-        log:info("claimed controller epoch %d", epoch)
+        self:_announce_controller(epoch)
     end
 
     for id, peer in pairs(self.peers) do

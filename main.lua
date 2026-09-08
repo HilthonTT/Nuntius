@@ -203,6 +203,20 @@ if is_main(arg, ...) then
                 { id = p.Id, address = p.Address, token = p.Token }
         end
         local cl_server_tls, cl_client_tls = build_tls(cl.Tls, "Cluster.Tls")
+        local raft = nil
+        local rf = cl.Raft
+        if rf and rf.Enabled ~= false then
+            raft = {
+                election_min    = rf.ElectionTimeoutMs and rf.ElectionTimeoutMs / 1000 or nil,
+                election_max    = rf.ElectionTimeoutMaxMs and rf.ElectionTimeoutMaxMs / 1000
+                                  or (rf.ElectionTimeoutMs and rf.ElectionTimeoutMs * 1.6 / 1000)
+                                  or nil,
+                heartbeat_s     = rf.HeartbeatMs and rf.HeartbeatMs / 1000 or nil,
+                rpc_timeout     = rf.RpcTimeoutMs and rf.RpcTimeoutMs / 1000 or nil,
+                commit_wait     = rf.CommitTimeoutSeconds,
+                max_log_entries = rf.MaxLogEntries,
+            }
+        end
         cluster = {
             broker_id    = cl.BrokerId,
             host         = cl.Host or "127.0.0.1",
@@ -213,6 +227,7 @@ if is_main(arg, ...) then
             batch_bytes  = cl.BatchBytes,
             server_tls   = cl_server_tls,
             tls          = cl_client_tls,
+            raft         = raft,
         }
     end
 

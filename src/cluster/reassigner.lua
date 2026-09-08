@@ -16,8 +16,16 @@ function Reassigner.new(opts)
         peers       = assert(opts.peers, "peers required"),
         self_id     = assert(opts.self_id, "self_id required"),
         reactor     = opts.reactor,
+        raft_commit = opts.raft_commit,
         batch_bytes = opts.batch_bytes or DEFAULT_BATCH_BYTES,
     }, Reassigner)
+end
+
+function Reassigner:_set_owner(topic_name, partition_id, owner)
+    if self.raft_commit then
+        return self.raft_commit(topic_name, partition_id, owner)
+    end
+    return self.assignments:set_owner(topic_name, partition_id, owner)
 end
 
 local function start_offset(partition)
@@ -96,12 +104,12 @@ function Reassigner:_move(topic_name, partition_id, dest_id)
     local copied_to, cerr = self:_copy_range(peer, topic_name, partition, from)
     if not copied_to then stop(); return nil, cerr end
 
-    local fok, ferr = self.assignments:set_owner(topic_name, partition_id, dest_id)
+    local fok, ferr = self:_set_owner(topic_name, partition_id, dest_id)
     if not fok then stop(); return nil, ferr end
 
     local drained_to, drr = self:_copy_range(peer, topic_name, partition, copied_to)
     if not drained_to then
-        self.assignments:set_owner(topic_name, partition_id, self.self_id)
+        self:_set_owner(topic_name, partition_id, self.self_id)
         stop()
         return nil, string.format("tail drain failed (ownership rolled back): %s", drr)
     end
@@ -129,7 +137,10 @@ function Reassigner:_move(topic_name, partition_id, dest_id)
         end
     end
 
-    local cok, coerr = peer:set_owner(topic_name, partition_id, dest_id)
+    local cok, coerr = true, nil
+    if not self.raft_commit then
+        cok, coerr = peer:set_owner(topic_name, partition_id, dest_id)
+    end
     stop()
     if not cok then
         log:warn("dest %s did not confirm ownership of %s/partition-%d: %s "

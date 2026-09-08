@@ -33,6 +33,7 @@ function M.new(opts)
         port        = assert(opts.port, "port required"),
         token       = opts.token,
         fence       = fence,
+        raft        = opts.raft,
         tls         = opts.tls,
         group_coordinator = opts.group_coordinator,
     }, M)
@@ -285,6 +286,25 @@ function M:_group_leave(body)
     return 200, { ok = true }
 end
 
+function M:_raft(path, body)
+    local node = self.raft
+    if not node then return 503, "raft: controller consensus is not enabled" end
+
+    local args = json.decode(body or "")
+    if type(args) ~= "table" then return 400, "raft: body must be a JSON object" end
+
+    local reply, err
+    if path == "/cluster/raft/vote" then
+        reply, err = node:handle_vote(args)
+    elseif path == "/cluster/raft/append" then
+        reply, err = node:handle_append(args)
+    else
+        reply, err = node:handle_snapshot(args)
+    end
+    if not reply then return 400, tostring(err) end
+    return 200, reply
+end
+
 function M:_loads()
     return 200, { broker_id = self.broker_id,
                   loads = local_loads.collect(self.broker, self.assignments) }
@@ -336,6 +356,15 @@ function M:_handle(sock)
                     httpk.header(headers, "X%-Forwarded%-Produce") ~= nil
                 status, out = self:_append(topic, partition, payload, forwarded)
             end
+        end
+    elseif method == "POST" and (path == "/cluster/raft/vote"
+        or path == "/cluster/raft/append" or path == "/cluster/raft/snapshot") then
+        local body, berr = httpk.read_body(
+            self.reactor, sock, leftover, clen, deadline, MAX_BODY)
+        if not body then
+            status, out = 400, "body: " .. tostring(berr)
+        else
+            status, out = self:_raft(path, body)
         end
     elseif method == "POST" and (path == "/cluster/ensure" or path == "/cluster/owner"
         or path == "/cluster/offsets" or path == "/cluster/controller/claim"
@@ -395,9 +424,10 @@ function M:start()
         log:error("cluster listen failed on %s:%d: %s", self.host, self.port, lerr)
         return nil, lerr
     end
-    log:info("cluster endpoint listening on %s:%d (broker_id=%s%s, %s)",
+    log:info("cluster endpoint listening on %s:%d (broker_id=%s%s, %s%s)",
         self.host, self.port, self.broker_id,
-        self.token and ", token auth on" or "", tls_m.describe(self.tls))
+        self.token and ", token auth on" or "", tls_m.describe(self.tls),
+        self.raft and ", raft consensus on" or "")
     return true
 end
 

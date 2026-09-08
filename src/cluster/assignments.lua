@@ -77,11 +77,33 @@ function Assignments:set_owner(topic, partition, owner)
 
     local k = key(topic, partition)
     local prev = self.map[k]
-    self.map[k] = (owner ~= self.self_id) and owner or nil
+    if prev == owner then return true end
+    self.map[k] = owner
 
     local ok, err = self:_save()
     if not ok then
         self.map[k] = prev
+        return nil, string.format("persist assignments: %s", tostring(err))
+    end
+    return true
+end
+
+function Assignments:replace(entries)
+    assert(type(entries) == "table", "entries must be a table")
+
+    local map = {}
+    for _, e in ipairs(entries) do
+        if type(e.topic) == "string" and type(e.partition) == "number"
+            and type(e.owner) == "string" then
+            map[key(e.topic, e.partition)] = e.owner
+        end
+    end
+
+    local prev = self.map
+    self.map = map
+    local ok, err = self:_save()
+    if not ok then
+        self.map = prev
         return nil, string.format("persist assignments: %s", tostring(err))
     end
     return true

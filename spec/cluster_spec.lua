@@ -167,11 +167,26 @@ describe("cluster assignments", function()
         assert.are.equal("A", reloaded:owner("orders", 1))
     end)
 
-    it("setting owner back to self removes the sparse entry", function()
+    it("records ownership handed back to self so a snapshot carries it", function()
         local n = make_node("A")
         assert.is_true(n.assignments:set_owner("orders", 2, "B"))
         assert.is_true(n.assignments:set_owner("orders", 2, "A"))
-        assert.are.equal(0, #n.assignments:entries())
+        assert.is_true(n.assignments:owned_by_self("orders", 2))
+        local entries = n.assignments:entries()
+        assert.are.equal(1, #entries)
+        assert.are.equal("A", entries[1].owner)
+    end)
+
+    it("replaces the whole map from a snapshot", function()
+        local n = make_node("A")
+        assert.is_true(n.assignments:set_owner("orders", 1, "B"))
+        assert.is_true(n.assignments:replace({
+            { topic = "orders", partition = 2, owner = "C" },
+        }))
+        assert.are.equal("A", n.assignments:owner("orders", 1))
+        assert.are.equal("C", n.assignments:owner("orders", 2))
+        local reloaded = assert(Assignments.new(n.dir, "A"))
+        assert.are.equal("C", reloaded:owner("orders", 2))
     end)
 end)
 
