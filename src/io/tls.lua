@@ -1,4 +1,6 @@
-local log = require("src.log.logger").get("tls")
+local b64  = require("src.core.base64")
+local sha2 = require("src.vendor.sha2")
+local log  = require("src.log.logger").get("tls")
 
 local M = {}
 
@@ -36,6 +38,43 @@ local function system_ca_file()
         if readable(path) then return path end
     end
     return nil
+end
+
+local CBIND_MODES = { disabled = true, preferred = true, required = true }
+
+M.CBIND_TYPE = "tls-server-end-point"
+
+function M.der_from_pem(pem)
+    if type(pem) ~= "string" then return nil, "certificate is not a string" end
+    local body = pem:match(
+        "%-%-%-%-%-BEGIN CERTIFICATE%-%-%-%-%-(.-)%-%-%-%-%-END CERTIFICATE%-%-%-%-%-")
+    if not body then return nil, "no PEM certificate found" end
+    return b64.decode((body:gsub("%s", "")))
+end
+
+function M.endpoint_hash_from_pem(pem)
+    local der, derr = M.der_from_pem(pem)
+    if not der then return nil, derr end
+    return sha2.hex_to_bin(sha2.sha256(der))
+end
+
+local function endpoint_hash_from_file(path)
+    local f = io.open(path, "rb")
+    if not f then return nil, string.format("cannot read %q", path) end
+    local pem = f:read("*a") or ""
+    f:close()
+    return M.endpoint_hash_from_pem(pem)
+end
+
+function M.peer_endpoint_hash(sock)
+    if type(sock) ~= "table" and type(sock) ~= "userdata" then return nil end
+    if type(sock.getpeercertificate) ~= "function" then return nil end
+    local ok, cert = pcall(sock.getpeercertificate, sock)
+    if not ok or not cert or type(cert.pem) ~= "function" then return nil end
+    local got, pem = pcall(cert.pem, cert)
+    if not got or type(pem) ~= "string" then return nil end
+    local hash = M.endpoint_hash_from_pem(pem)
+    return hash
 end
 
 local function copy(list)
@@ -136,11 +175,36 @@ local function build(block, where, mode)
         return nil, string.format("%s: HandshakeTimeout must be a positive number", where)
     end
 
+    local cbind = field(block, "ChannelBinding", "channel_binding")
+    cbind = tostring(cbind or "preferred"):lower()
+    if not CBIND_MODES[cbind] then
+        return nil, string.format(
+            "%s: ChannelBinding must be disabled, preferred or required (got %q)",
+            where, cbind)
+    end
+
+    local endpoint_hash
+    if mode == "server" and cbind ~= "disabled" then
+        local hash, herr = endpoint_hash_from_file(params.certificate)
+        if hash then
+            endpoint_hash = hash
+        elseif cbind == "required" then
+            return nil, string.format(
+                "%s: ChannelBinding=required needs a PEM CertFile: %s",
+                where, tostring(herr))
+        else
+            log:warn("%s: channel binding is off, CertFile %q is not PEM: %s",
+                where, tostring(params.certificate), tostring(herr))
+        end
+    end
+
     return {
         params            = params,
         handshake_timeout = timeout,
         verify            = verify,
         server_name       = field(block, "ServerName", "server_name"),
+        channel_binding   = cbind,
+        endpoint_hash     = endpoint_hash,
     }, nil
 end
 

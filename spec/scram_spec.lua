@@ -95,10 +95,17 @@ end)
 
 describe("SCRAM message parsing", function()
 
-    it("rejects a client-first that demands channel binding we cannot provide", function()
-        local ok, err = scram.parse_client_first("p=tls-unique,,n=user,r=abc")
+    it("parses a client-first that demands channel binding", function()
+        local first = assert(scram.parse_client_first("p=tls-unique,,n=user,r=abc"))
+        assert.are.equal("p", first.cbind_flag)
+        assert.are.equal("tls-unique", first.cbind_name)
+        assert.are.equal("p=tls-unique,,", first.gs2)
+    end)
+
+    it("rejects a channel-binding flag with no type", function()
+        local ok, err = scram.parse_client_first("p,,n=user,r=abc")
         assert.is_nil(ok)
-        assert.is_truthy(err:find("channel binding"))
+        assert.is_truthy(err:find("channel%-binding flag"))
     end)
 
     it("rejects an authzid rather than silently ignoring it", function()
@@ -256,6 +263,75 @@ describe("SCRAM exchange", function()
         assert.is_true(scram.check_cbind(first.gs2, "biws"))
         assert.is_false((scram.check_cbind(first.gs2, "eSws")))
         assert.is_false((scram.check_cbind(first.gs2, nil)))
+    end)
+end)
+
+describe("SCRAM channel binding", function()
+
+    local BIND  = string.rep(string.char(7), 32)
+    local OTHER = string.rep(string.char(9), 32)
+
+    local function client_first_with(flag)
+        return assert(scram.parse_client_first(flag .. "n=alice,r=abc"))
+    end
+
+    it("binds a p= exchange to the endpoint hash the server offers", function()
+        local first = client_first_with("p=tls-server-end-point,,")
+        assert.are.equal(BIND, scram.negotiate_cbind(first, BIND, "preferred"))
+    end)
+
+    it("refuses a channel-binding type it does not implement", function()
+        local first = client_first_with("p=tls-unique,,")
+        local bound, err = scram.negotiate_cbind(first, BIND, "preferred")
+        assert.is_nil(bound)
+        assert.is_truthy(err:find("unsupported channel%-binding type"))
+    end)
+
+    it("refuses p= on a connection with nothing to bind to", function()
+        local first = client_first_with("p=tls-server-end-point,,")
+        local bound, err = scram.negotiate_cbind(first, nil, "preferred")
+        assert.is_nil(bound)
+        assert.is_truthy(err:find("not available"))
+    end)
+
+    it("treats y= as a downgrade when the server can bind", function()
+        local first = client_first_with("y,,")
+        local bound, err = scram.negotiate_cbind(first, BIND, "preferred")
+        assert.is_nil(bound)
+        assert.is_truthy(err:find("downgrade"))
+
+        assert.are.equal("", scram.negotiate_cbind(first, nil, "preferred"))
+    end)
+
+    it("lets an unbound client through unless the listener requires binding", function()
+        local first = client_first_with("n,,")
+        assert.are.equal("", scram.negotiate_cbind(first, BIND, "preferred"))
+
+        local bound, err = scram.negotiate_cbind(first, BIND, "required")
+        assert.is_nil(bound)
+        assert.is_truthy(err:find("requires"))
+    end)
+
+    it("round-trips a bound exchange and rejects a swapped certificate", function()
+        local salted = pbkdf2.pbkdf2_hmac_sha256("pencil", "salt-salt-salt-sa", 1, 32)
+        local client_first, bare, gs2 =
+            scram.client_first("alice", "cnonce", scram.CBIND_TYPE)
+        local first = assert(scram.parse_client_first(client_first))
+        local bound = assert(scram.negotiate_cbind(first, BIND, "preferred"))
+
+        local server_first = scram.server_first("cnonce-server", "salt-salt-salt-sa", 1)
+        local message = scram.client_final(salted, bare, server_first,
+            "cnonce-server", gs2 .. BIND)
+        local final = assert(scram.parse_client_final(message))
+
+        assert.is_true(scram.check_cbind(first.gs2, final.cbind, bound))
+        assert.is_false((scram.check_cbind(first.gs2, final.cbind, OTHER)))
+        assert.is_false((scram.check_cbind(first.gs2, final.cbind, nil)))
+
+        local stored_key = scram.keys_from_salted(salted)
+        local auth_message = scram.auth_message(first.bare, server_first,
+            final.without_proof)
+        assert.is_true(scram.verify_proof(stored_key, auth_message, final.proof))
     end)
 end)
 

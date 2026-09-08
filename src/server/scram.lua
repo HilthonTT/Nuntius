@@ -8,6 +8,7 @@ M.MECHANISM = "SCRAM-SHA-256"
 
 M.GS2_HEADER  = "n,,"
 M.GS2_CBIND   = "biws"
+M.CBIND_TYPE  = "tls-server-end-point"
 
 local function hmac_bin(key, msg)
     return sha2.hex_to_bin(sha2.hmac(sha2.sha256, key, msg))
@@ -84,15 +85,21 @@ function M.parse_client_first(message)
     end
 
     local cbind_flag = message:sub(1, 1)
-    if cbind_flag == "p" then
-        return nil, "channel binding is not supported"
-    end
-    if cbind_flag ~= "n" and cbind_flag ~= "y" then
+    if cbind_flag ~= "n" and cbind_flag ~= "y" and cbind_flag ~= "p" then
         return nil, "malformed gs2 header"
     end
 
     local comma1 = message:find(",", 1, true)
     if not comma1 then return nil, "malformed gs2 header" end
+
+    local head = message:sub(1, comma1 - 1)
+    local cbind_name
+    if cbind_flag == "p" then
+        cbind_name = head:match("^p=(.+)$")
+        if not cbind_name then return nil, "malformed channel-binding flag" end
+    elseif head ~= cbind_flag then
+        return nil, "malformed gs2 header"
+    end
     local comma2 = message:find(",", comma1 + 1, true)
     if not comma2 then return nil, "malformed gs2 header" end
 
@@ -111,11 +118,36 @@ function M.parse_client_first(message)
     if username == "" then return nil, "empty username" end
 
     return {
-        username = username,
-        nonce    = fields.r,
-        bare     = bare,
-        gs2      = message:sub(1, comma2),
+        username   = username,
+        nonce      = fields.r,
+        bare       = bare,
+        gs2        = message:sub(1, comma2),
+        cbind_flag = cbind_flag,
+        cbind_name = cbind_name,
     }, nil
+end
+
+function M.negotiate_cbind(first, cbind_data, mode)
+    mode = mode or "preferred"
+
+    if first.cbind_flag == "p" then
+        if mode == "disabled" or not cbind_data then
+            return nil, "channel binding is not available on this connection"
+        end
+        if first.cbind_name ~= M.CBIND_TYPE then
+            return nil, string.format("unsupported channel-binding type %q",
+                tostring(first.cbind_name))
+        end
+        return cbind_data
+    end
+
+    if mode == "required" then
+        return nil, "this listener requires SCRAM channel binding"
+    end
+    if first.cbind_flag == "y" and cbind_data then
+        return nil, "channel-binding downgrade detected"
+    end
+    return ""
 end
 
 function M.server_first(combined_nonce, salt, iterations)
@@ -147,8 +179,8 @@ function M.parse_client_final(message)
     }, nil
 end
 
-function M.check_cbind(client_first_gs2, c_field)
-    return ct.equal(b64.encode(client_first_gs2), c_field or "")
+function M.check_cbind(client_first_gs2, c_field, cbind_data)
+    return ct.equal(b64.encode(client_first_gs2 .. (cbind_data or "")), c_field or "")
 end
 
 function M.auth_message(client_first_bare, server_first, client_final_without_proof)
@@ -168,9 +200,10 @@ function M.server_final(server_key, auth_message)
 end
 
 
-function M.client_first(username, nonce)
+function M.client_first(username, nonce, cbind_type)
+    local gs2 = cbind_type and ("p=" .. cbind_type .. ",,") or M.GS2_HEADER
     local bare = string.format("n=%s,r=%s", M.escape_username(username), nonce)
-    return M.GS2_HEADER .. bare, bare
+    return gs2 .. bare, bare, gs2
 end
 
 function M.parse_server_first(message, client_nonce)
@@ -199,8 +232,10 @@ function M.parse_server_first(message, client_nonce)
     return { nonce = fields.r, salt = salt, iterations = iterations }, nil
 end
 
-function M.client_final(salted_password, client_first_bare, server_first, combined_nonce)
-    local without_proof = string.format("c=%s,r=%s", M.GS2_CBIND, combined_nonce)
+function M.client_final(salted_password, client_first_bare, server_first,
+                       combined_nonce, cbind_input)
+    local without_proof = string.format("c=%s,r=%s",
+        b64.encode(cbind_input or M.GS2_HEADER), combined_nonce)
     local auth_message  = M.auth_message(client_first_bare, server_first, without_proof)
 
     local client_key       = hmac_bin(salted_password, "Client Key")

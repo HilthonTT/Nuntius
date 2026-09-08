@@ -24,6 +24,7 @@ function Client.new(opts)
     local host = opts.host or "127.0.0.1"
     local port = opts.port or 9092
 
+    local cbind = nil
     local sock, cerr = socket.connect(host, port)
     if not sock then
         return nil, string.format("connect %s:%d: %s", host, port, tostring(cerr))
@@ -47,10 +48,14 @@ function Client.new(opts)
             return nil, string.format("tls %s:%d: %s", host, port, tostring(herr))
         end
         sock = secured
+        if opts.channel_binding ~= false then
+            cbind = tls_m.peer_endpoint_hash(sock)
+        end
     end
 
     local c = setmetatable({
         sock = sock,
+        cbind = cbind,
         reactor = opts.reactor,
         timeout = opts.timeout or DEFAULT_TIMEOUT,
         host = host,
@@ -249,7 +254,8 @@ end
 
 function Client:_auth_scram(username, password)
     local client_nonce = scram.nonce(rng.bytes)
-    local client_first, client_first_bare = scram.client_first(username, client_nonce)
+    local client_first, client_first_bare, gs2 = scram.client_first(
+        username, client_nonce, self.cbind and scram.CBIND_TYPE or nil)
 
     local correl = uuid.bytes()
     local ok, err = self:_write(
@@ -275,7 +281,8 @@ function Client:_auth_scram(username, password)
     local salted = pbkdf2.pbkdf2_hmac_sha256(password, server_first.salt,
         server_first.iterations, 32)
     local client_final, expected_signature = scram.client_final(
-        salted, client_first_bare, challenge.message, server_first.nonce)
+        salted, client_first_bare, challenge.message, server_first.nonce,
+        gs2 .. (self.cbind or ""))
 
     local fcorrel = uuid.bytes()
     ok, err = self:_write(proto.encode_auth_scram_final(fcorrel, client_final))

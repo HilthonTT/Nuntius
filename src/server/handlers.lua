@@ -251,6 +251,15 @@ function M.auth_scram(server, conn, correl, payload)
         return
     end
 
+    local tls_cfg = server.tls
+    local bound, cberr = scram_m.negotiate_cbind(first,
+        tls_cfg and tls_cfg.endpoint_hash or nil,
+        tls_cfg and tls_cfg.channel_binding or "disabled")
+    if not bound then
+        conn:close(Connection.REASON_BAD_PROTOCOL, proto.ERR_BAD_PROTOCOL, cberr)
+        return
+    end
+
     local credential, principal = server.authenticator:scram_credential(first.username)
     local combined_nonce = first.nonce .. scram_m.nonce(rng.bytes)
     local server_first = scram_m.server_first(combined_nonce,
@@ -263,6 +272,7 @@ function M.auth_scram(server, conn, correl, payload)
         nonce        = combined_nonce,
         client_first = first.bare,
         gs2          = first.gs2,
+        cbind        = bound,
         server_first = server_first,
     }
 
@@ -307,7 +317,7 @@ function M.auth_scram_final(server, conn, correl, payload)
         reject("scram nonce mismatch")
         return
     end
-    if not scram_m.check_cbind(state.gs2, final.cbind) then
+    if not scram_m.check_cbind(state.gs2, final.cbind, state.cbind) then
         reject("scram channel-binding mismatch")
         return
     end

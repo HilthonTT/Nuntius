@@ -375,15 +375,53 @@ crypto is exactly the work a lockout exists to stop an abusive peer from
 buying. Such a peer gets a TCP close rather than a protocol error frame,
 because on a TLS listener there is no session to send one over yet.
 
+### Channel binding
+
+SCRAM proves that both ends know the password. It does not prove that the TLS
+connection carrying the exchange is the one the broker terminated — a relay
+holding a certificate the client trusts can terminate TLS, replay the SCRAM
+messages to the real broker, and own the session afterwards. Channel binding
+closes that by mixing something unique to *this* TLS connection into the
+exchange.
+
+MoonMQ implements `tls-server-end-point` (RFC 5929): the binding value is the
+SHA-256 of the listener's DER-encoded certificate. The server derives it from
+`CertFile` at boot; the client derives it from the certificate it was actually
+handed during the handshake. A relay presenting a different certificate produces
+a different hash, the proof no longer verifies, and the login fails.
+
+It is on by default on any TLS listener and needs nothing from the client
+beyond `mechanism = "scram-sha-256"` — the client offers binding whenever it
+has a TLS socket:
+
+```json
+"Server": { "Tls": { "CertFile": "…", "KeyFile": "…",
+                     "ChannelBinding": "preferred" } }
+```
+
+| `ChannelBinding` | Behaviour |
+| --- | --- |
+| `preferred` (default) | Bind whenever the client asks (`p=tls-server-end-point`). An unbound `n,,` client still logs in. |
+| `required` | Refuse any SCRAM login that is not bound. |
+| `disabled` | Do not offer binding; `p=` is refused. |
+
+The interesting case is the middle one in the gs2 header. A client that
+supports binding but believes the *server* does not opens with `y,,`. If this
+broker can bind, that belief can only have come from something rewriting the
+negotiation, so `y,,` is refused as a downgrade — which is the whole point of
+that flag existing. `client_final`'s `c=` field is checked against the gs2
+header **plus** the binding value, in constant time, so neither can be swapped
+independently.
+
+Passing `channel_binding = false` to `Client.new` opts a client out.
+
 ### Not covered
 
-* **Channel binding.** SCRAM advertises `n,,` (no binding). Now that there is a
-  TLS channel, `tls-server-end-point` binding is implementable; the client-final
-  `c=` field is already validated against the header the client opened with, so
-  a downgrade would be detectable.
 * **Certificate reloading.** A renewed certificate needs a broker restart.
 * **Certificate-derived principals.** An mTLS client certificate authenticates
   the *connection*; the MoonMQ principal still comes from AUTH or SCRAM.
+* **`tls-unique` binding.** Only `tls-server-end-point` is implemented;
+  `tls-unique` is not available under TLS 1.3 anyway.
 
 ---
 
@@ -451,3 +489,6 @@ missing.
    replication port carries the entire log.
 9. Watch `moonmq_tls_handshake_failures_total`: a steady nonzero rate is either
    a client that has not been switched over, or someone probing the port.
+10. Once every client speaks SCRAM over TLS, set
+    `Server.Tls.ChannelBinding: "required"` — it turns "the password is safe"
+    into "this session is the one the broker terminated".

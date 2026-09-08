@@ -420,6 +420,22 @@ describe("tls over the reactor", function()
         assert.are.equal("mutual", out.echoed)
     end)
 
+    it("gives the client the endpoint hash the server binds SCRAM to", function()
+        local expected = assert(tls_m.server_config(
+            { CertFile = CERT, KeyFile = KEY }, "test server")).endpoint_hash
+        assert.is_truthy(expected)
+
+        local result = exchange(
+            { CertFile = CERT, KeyFile = KEY },
+            { CaFile = CERT, Verify = "peer" },
+            function(_, sock)
+                return { hash = tls_m.peer_endpoint_hash(sock) }
+            end, 19310)
+
+        assert.is_truthy(result.hash)
+        assert.are.equal(expected, result.hash)
+    end)
+
     it("refuses a plaintext client on a TLS listener", function()
         local reactor = Reactor.new()
         local server_cfg = assert(tls_m.server_config(
@@ -577,4 +593,42 @@ describe("reactor want-state handling", function()
         local ok = coroutine.resume(co)
         assert.is_true(ok)
     end)
+end)
+
+describe("tls channel binding", function()
+
+    it("rejects anything that is not a PEM certificate", function()
+        assert.is_nil((tls_m.der_from_pem("not a certificate")))
+        assert.is_nil((tls_m.der_from_pem(nil)))
+        assert.is_nil((tls_m.endpoint_hash_from_pem("-----BEGIN NOTHING-----")))
+    end)
+
+    it("derives a 32-byte endpoint hash that is unique per certificate", function()
+        if not have_certs then return end
+        local cfg = assert(tls_m.server_config(
+            { CertFile = CERT, KeyFile = KEY }, "Server.Tls"))
+        assert.are.equal("preferred", cfg.channel_binding)
+        assert.are.equal(32, #cfg.endpoint_hash)
+
+        local other = assert(tls_m.server_config(
+            { CertFile = OTHER_CERT, KeyFile = OTHER_KEY }, "Server.Tls"))
+        assert.are_not.equal(cfg.endpoint_hash, other.endpoint_hash)
+    end)
+
+    it("leaves the hash out when channel binding is switched off", function()
+        if not have_certs then return end
+        local cfg = assert(tls_m.server_config(
+            { CertFile = CERT, KeyFile = KEY, ChannelBinding = "disabled" },
+            "Server.Tls"))
+        assert.is_nil(cfg.endpoint_hash)
+    end)
+
+    it("refuses an unknown ChannelBinding mode", function()
+        if not have_certs then return end
+        local cfg, err = tls_m.server_config(
+            { CertFile = CERT, KeyFile = KEY, ChannelBinding = "maybe" }, "Server.Tls")
+        assert.is_nil(cfg)
+        assert.is_truthy(err:find("ChannelBinding"))
+    end)
+
 end)
