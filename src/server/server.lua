@@ -71,6 +71,7 @@ local DEFAULT_MAX_GROUPS = 1024
 local DEFAULT_CLEANER_TICK_INTERVAL_S = 5
 local DEFAULT_PRODUCER_EXPIRY_S       = 24 * 60 * 60
 local DEFAULT_PRODUCER_EXPIRY_CHECK_INTERVAL_S = 300
+local TLS_RELOAD_POLL_S = 1
 
 local Server = {}
 Server.__index = Server
@@ -119,6 +120,10 @@ function Server.new(opts)
         "Metrics-endpoint requests refused for missing or bad credentials.")
     metrics.describe("moonmq_tls_handshakes_total", "counter",
         "Completed TLS handshakes across every listener.")
+    metrics.describe("moonmq_tls_reloads_total", "counter",
+        "TLS listener configurations revalidated and swapped in on SIGHUP.")
+    metrics.describe("moonmq_tls_reload_failures_total", "counter",
+        "SIGHUP reloads refused because the new certificate or key was unusable.")
     metrics.describe("moonmq_tls_handshake_failures_total", "counter",
         "TLS handshakes that failed: an untrusted or missing client "
         .. "certificate, a plaintext client on a TLS port, or a stalled peer.")
@@ -423,6 +428,38 @@ function Server:_install_signal_handlers()
     signal.signal(signal.SIGINT,  on_signal)
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGTSTP, on_signal)
+
+    if signal.SIGHUP then
+        signal.signal(signal.SIGHUP, function()
+            self.tls_reload_requested = true
+        end)
+        log:info("SIGHUP reloads TLS certificates without a restart")
+    end
+end
+
+function Server:reload_tls()
+    local reloaded, rotated, errors = tls_m.reload_all()
+    for _, err in ipairs(errors) do
+        log:error("TLS reload: %s", err)
+    end
+    if reloaded > 0 then metrics.inc("moonmq_tls_reloads_total", reloaded) end
+    if #errors > 0 then
+        metrics.inc("moonmq_tls_reload_failures_total", #errors)
+    end
+    log:info("TLS reload: %d listener(s) revalidated, %d certificate(s) changed, "
+        .. "%d refused", reloaded, rotated, #errors)
+    return reloaded, rotated, errors
+end
+
+function Server:_run_tls_reload_watch()
+    while self.running do
+        self.reactor:sleep(TLS_RELOAD_POLL_S)
+        if self.tls_reload_requested then
+            self.tls_reload_requested = false
+            local ok, err = pcall(self.reload_tls, self)
+            if not ok then log:error("TLS reload failed: %s", tostring(err)) end
+        end
+    end
 end
 
 function Server:start()
@@ -460,6 +497,7 @@ function Server:start()
     self.running = true
     self.reactor:spawn(function() self:_run_group_reaper() end)
     self.reactor:spawn(function() self:_run_cleaner_tick() end)
+    self.reactor:spawn(function() self:_run_tls_reload_watch() end)
     if self.producer_expiry_s and self.producer_expiry_s > 0 then
         self.reactor:spawn(function() self:_run_producer_expiry() end)
     end

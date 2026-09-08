@@ -135,7 +135,7 @@ local function build_tls(block, where, mode)
         end
     end
 
-    return server_cfg, client_cfg
+    return tls_m.register(server_cfg), tls_m.register(client_cfg)
 end
 
 local function build_metrics_auth(cfg)

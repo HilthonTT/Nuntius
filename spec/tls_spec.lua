@@ -632,3 +632,72 @@ describe("tls channel binding", function()
     end)
 
 end)
+
+describe("tls certificate reload", function()
+
+    local function copy_file(from, to)
+        local src = assert(io.open(from, "rb"))
+        local data = src:read("*a")
+        src:close()
+        local dst = assert(io.open(to, "wb"))
+        dst:write(data)
+        dst:close()
+    end
+
+    it("picks up a rotated certificate without a restart", function()
+        if not have_certs then return end
+        local live = BASE_DIR .. "/live-cert.pem"
+        local live_key = BASE_DIR .. "/live-key.pem"
+        copy_file(CERT, live)
+        copy_file(KEY, live_key)
+
+        local cfg = assert(tls_m.server_config(
+            { CertFile = live, KeyFile = live_key }, "Server.Tls"))
+        local before = cfg.endpoint_hash
+
+        copy_file(OTHER_CERT, live)
+        copy_file(OTHER_KEY, live_key)
+
+        local ok, rotated = tls_m.reload(cfg)
+        assert.is_true(ok)
+        assert.is_true(rotated)
+        assert.are_not.equal(before, cfg.endpoint_hash)
+    end)
+
+    it("keeps the running config when the new certificate is unusable", function()
+        if not have_certs then return end
+        local live = BASE_DIR .. "/broken-cert.pem"
+        local live_key = BASE_DIR .. "/broken-key.pem"
+        copy_file(CERT, live)
+        copy_file(KEY, live_key)
+
+        local cfg = assert(tls_m.server_config(
+            { CertFile = live, KeyFile = live_key }, "Server.Tls"))
+        local before = cfg.endpoint_hash
+
+        local f = assert(io.open(live, "wb"))
+        f:write("-----BEGIN CERTIFICATE-----\nnot base64 at all\n")
+        f:close()
+
+        local ok, err = tls_m.reload(cfg)
+        assert.is_nil(ok)
+        assert.is_truthy(err)
+        assert.are.equal(before, cfg.endpoint_hash)
+    end)
+
+    it("refuses to reload a config that was not built from a block", function()
+        local ok, err = tls_m.reload({ params = {} })
+        assert.is_nil(ok)
+        assert.is_truthy(err:find("reloadable"))
+    end)
+
+    it("reloads every registered listener at once", function()
+        if not have_certs then return end
+        local cfg = assert(tls_m.register(tls_m.server_config(
+            { CertFile = CERT, KeyFile = KEY }, "Server.Tls")))
+        local reloaded, _, errors = tls_m.reload_all()
+        assert.is_true(reloaded >= 1)
+        assert.are.equal(0, #errors)
+        assert.are.equal(32, #cfg.endpoint_hash)
+    end)
+end)

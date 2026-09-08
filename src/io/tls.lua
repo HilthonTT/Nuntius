@@ -205,7 +205,66 @@ local function build(block, where, mode)
         server_name       = field(block, "ServerName", "server_name"),
         channel_binding   = cbind,
         endpoint_hash     = endpoint_hash,
+        source            = block,
+        where             = where,
+        mode              = mode,
     }, nil
+end
+
+local reloadable = {}
+
+function M.register(cfg)
+    if type(cfg) ~= "table" then return cfg end
+    reloadable[#reloadable + 1] = cfg
+    return cfg
+end
+
+function M.validate(params)
+    if not ssl or type(ssl.newcontext) ~= "function" then return true end
+    local ok, ctx = pcall(ssl.newcontext, params)
+    if not ok then return nil, tostring(ctx) end
+    if not ctx then return nil, "openssl rejected the certificate or key" end
+    return true
+end
+
+function M.reload(cfg)
+    if type(cfg) ~= "table" or cfg.source == nil then
+        return nil, "this TLS config was not built from a reloadable block"
+    end
+
+    local fresh, err = build(cfg.source, cfg.where, cfg.mode)
+    if not fresh then
+        return nil, err or string.format(
+            "%s: the reloaded block disables TLS; keeping the running config", cfg.where)
+    end
+
+    local vok, verr = M.validate(fresh.params)
+    if not vok then
+        return nil, string.format("%s: %s", cfg.where, tostring(verr))
+    end
+
+    local rotated = cfg.endpoint_hash ~= fresh.endpoint_hash
+    cfg.params            = fresh.params
+    cfg.verify            = fresh.verify
+    cfg.server_name       = fresh.server_name
+    cfg.handshake_timeout = fresh.handshake_timeout
+    cfg.channel_binding   = fresh.channel_binding
+    cfg.endpoint_hash     = fresh.endpoint_hash
+    return true, rotated
+end
+
+function M.reload_all()
+    local reloaded, rotated, errors = 0, 0, {}
+    for _, cfg in ipairs(reloadable) do
+        local ok, info = M.reload(cfg)
+        if ok then
+            reloaded = reloaded + 1
+            if info then rotated = rotated + 1 end
+        else
+            errors[#errors + 1] = tostring(info)
+        end
+    end
+    return reloaded, rotated, errors
 end
 
 function M.server_config(block, where)

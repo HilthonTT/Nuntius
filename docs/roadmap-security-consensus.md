@@ -1,4 +1,4 @@
-# Roadmap notes: TLS and controller consensus (both shipped)
+# Roadmap notes: TLS (shipped) and controller consensus
 
 Two design gaps assessed on 2026-07-19, alongside the batch that shipped
 producer-state expiry, cross-broker transactional produce, and cluster-wide
@@ -30,8 +30,8 @@ records the integration points so the work can start without re-scoping.
 >   without the broker performing the asymmetric crypto — a lockout that still
 >   pays for a handshake is not much of a lockout.
 >
-> **Update (2026-09-08). SCRAM channel binding has shipped.** It went in as
-> scoped: the binding value
+> **Update (2026-09-08). Both remaining TLS items have shipped.** SCRAM
+> channel binding (`tls-server-end-point`) went in as scoped: the binding value
 > is SHA-256 over the listener's DER certificate, derived from `CertFile`
 > server-side and from `getpeercertificate()` client-side, and `check_cbind`
 > now compares the gs2 header *concatenated with* that value. The part worth
@@ -40,7 +40,12 @@ records the integration points so the work can start without re-scoping.
 > whole feature bypassable, so a broker that *can* bind refuses `y,,` outright.
 > `ChannelBinding` is `preferred` by default and `required` is available.
 >
-> Still open on the TLS side: certificate reload needs a restart.
+> Certificate reload is `SIGHUP`. The mechanism is smaller than expected —
+> `Reactor:listen` already reads `tls_cfg.params` per accept, so swapping the
+> table is enough — and the work was in refusing a bad swap: the new params are
+> pushed through `ssl.newcontext` before they replace the running ones, and a
+> failure keeps the old config rather than converting a renewal typo into a
+> dead listener. The handler only sets a flag; the reload runs on the reactor.
 
 ## TLS (client protocol + inter-broker HTTP) — SHIPPED
 
@@ -79,35 +84,9 @@ completing, so TLS must be woven into the event loop, not wrapped around it:
 integration tests (the current spec suite drives routes in-process and would
 not exercise the handshake paths at all).
 
-## Controller consensus (beyond epoch fencing) — SHIPPED
+## Controller consensus (beyond epoch fencing)
 
-> **Update (2026-09-08). Shipped as `Server.Cluster.Raft`**, and essentially to
-> this scope: static membership from `Cluster.Peers`, a replicated log carrying
-> controller claims and partition ownership, the data path untouched.
-> `src/cluster/raft/` holds the store, the node state machine, the reactor
-> service and a `ControllerFence`-shaped adapter, so `cluster_server.lua` and
-> `balance_loop.lua` see the same interface whether consensus is on or off.
-> See [cluster.md](cluster.md).
->
-> Three departures from the plan below:
->
-> * **`assignments.lua` now records self-owned partitions** instead of treating
->   "absent" as "mine". The sparse form was broker-relative, so a snapshot taken
->   on b1 silently lost every partition b1 owned. Consensus needs the table to
->   mean the same thing on every broker.
-> * **The RPC client is reactor-native**, not `socket.http`. The existing peer
->   client blocks, which is tolerable once every 60 s in the balance loop and
->   not at all tolerable at a 500 ms heartbeat with an unreachable peer.
-> * **Snapshotting was not optional.** The log is metadata-only but ownership
->   changes are unbounded over a broker's life, so compaction plus a
->   `/cluster/raft/snapshot` route came in with the first version rather than
->   later.
->
-> Still open: membership changes need a restart (no joint consensus), and the
-> group-coordinator liveness hints listed below were left out as the note
-> suggested.
-
-**Status when this was written:** `controller_fence.lua` is fencing, not consensus — a
+**Status today:** `controller_fence.lua` is fencing, not consensus — a
 durable monotonic epoch, propagated on requests, refusing superseded
 controllers with 409. Split-brain is possible when two claimants act against
 disjoint reachable peers, and epoch-less requests bypass the fence.

@@ -415,9 +415,35 @@ independently.
 
 Passing `channel_binding = false` to `Client.new` opts a client out.
 
+### Certificate rotation
+
+`SIGHUP` reloads every configured TLS listener without dropping a connection or
+restarting the broker:
+
+```bash
+kill -HUP $(pidof lua5.4)     # or: systemctl reload moonmq
+```
+
+Each listener's block is re-read, the certificate and key are re-validated
+through OpenSSL, and the new parameters are swapped in for connections accepted
+after that point. Sessions already established keep the certificate they
+negotiated with. The channel-binding hash is recomputed at the same time, so a
+rotated certificate immediately binds new SCRAM logins to the new key.
+
+A reload that cannot produce a usable context — a half-written PEM, a key that
+does not match the certificate, an unreadable path — is **refused**, logged, and
+the running configuration is kept. That is the whole reason reloading validates
+rather than letting `ssl.wrap` discover the problem one failed handshake at a
+time. Watch `moonmq_tls_reloads_total` and `moonmq_tls_reload_failures_total`;
+a certificate-renewal hook that fires without the counter moving is a hook that
+is not reaching the broker.
+
+The signal handler only sets a flag — the reload itself runs on the reactor,
+because reading and parsing certificates inside a signal handler is not
+something to do to a running broker.
+
 ### Not covered
 
-* **Certificate reloading.** A renewed certificate needs a broker restart.
 * **Certificate-derived principals.** An mTLS client certificate authenticates
   the *connection*; the MoonMQ principal still comes from AUTH or SCRAM.
 * **`tls-unique` binding.** Only `tls-server-end-point` is implemented;
@@ -492,3 +518,5 @@ missing.
 10. Once every client speaks SCRAM over TLS, set
     `Server.Tls.ChannelBinding: "required"` — it turns "the password is safe"
     into "this session is the one the broker terminated".
+11. Reload certificates with `SIGHUP` rather than a restart, and alert on
+    `moonmq_tls_reload_failures_total`.

@@ -27,9 +27,9 @@ records.
 | **Delivery** | Pull (`FETCH`) or push (`SUBSCRIBE`), consumer groups with a range assignor and durable offsets, DLQ with NACK. |
 | **Throughput** | Record batching on both sides: one frame for N records, one fsync per partition instead of per record. |
 | **Correctness** | Idempotent producer (PID + sequence dedupe), multi-partition transactions, `read_committed` isolation with LSO. |
-| **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups, single-leader replication with `acks=all`. Optional Raft consensus over cluster metadata: a majority-elected controller and a replicated ownership table. |
+| **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups, single-leader replication with `acks=all`. |
 | **Admin** | Create/describe/delete topics, alter topic config at runtime, list/describe/delete consumer groups, seek by timestamp. |
-| **Security** | TLS on every listener (mutual TLS optional), multiple users with per-topic/group/cluster ACLs, SCRAM-SHA-256 with `tls-server-end-point` channel binding, per-user and per-topic quotas, optional auth on the metrics port. |
+| **Security** | TLS on every listener (mutual TLS optional, `SIGHUP` reloads certificates), multiple users with per-topic/group/cluster ACLs, SCRAM-SHA-256 with `tls-server-end-point` channel binding, per-user and per-topic quotas, optional auth on the metrics port. |
 | **Ops** | Prometheus `/metrics`, JSON `/stats`, PBKDF2 auth with per-IP lockout, an interactive SQL-like console (MQL). |
 
 ## Quick start
@@ -286,6 +286,11 @@ the broker cannot bind, when it can, is refused as a downgrade rather than
 quietly logged in. It is on by default; `"ChannelBinding": "required"` refuses
 any unbound SCRAM login once every client has been switched over.
 
+`SIGHUP` reloads every TLS listener's certificate without a restart. The new
+certificate and key are pushed through OpenSSL first, and a reload that cannot
+produce a usable context is refused with the running one kept — a renewal typo
+should not cost you the listener.
+
 `Verify: "required"` on a listener is mutual TLS — a client without a valid
 certificate is refused. Clients verify the chain *and* the hostname (luasec
 checks only the chain, which would accept any certificate the CA ever issued).
@@ -309,22 +314,10 @@ Clustering is configured under `Server.Cluster` / `Server.Autobalance`:
 ```json
 "Server": {
   "Cluster":     { "BrokerId": "b1", "Port": 9095,
-                   "Peers": [ { "Id": "b2", "Address": "10.0.0.2:9095" } ],
-                   "Raft":  { "Enabled": true } },
+                   "Peers": [ { "Id": "b2", "Address": "10.0.0.2:9095" } ] },
   "Autobalance": { "IntervalSeconds": 60, "DryRun": true }
 }
 ```
-
-`Raft` is what makes "who is the controller" and "who owns which partition"
-facts the cluster agrees on rather than a local epoch file and a
-last-writer-wins ownership table. The controller is elected by a majority,
-ownership changes commit through a replicated log before the reassigner drains
-a partition's tail, and a leader that loses contact with a majority steps down
-instead of acting alone. The balance loop then runs only on the elected
-controller, so it no longer matters which broker you enabled it on. The data
-path is untouched — records still go to one owner per partition; consensus only
-decides who that is. Omit the block and the broker keeps the previous
-epoch-fencing behaviour. Details: [docs/cluster.md](docs/cluster.md).
 
 ## Testing
 
@@ -369,7 +362,7 @@ and fetch paths, wire protocol, and metrics — then
 | [docs/dlq.md](docs/dlq.md) | Dead-letter queue and NACK semantics |
 | [docs/security.md](docs/security.md) | TLS, users, ACLs, SCRAM-SHA-256, quotas, metrics-endpoint auth |
 | [docs/mql.md](docs/mql.md) | The interactive console's SQL-like grammar |
-| [docs/roadmap-security-consensus.md](docs/roadmap-security-consensus.md) | Design record: how TLS and controller consensus were scoped, and where they landed |
+| [docs/roadmap-security-consensus.md](docs/roadmap-security-consensus.md) | Scoped-but-unshipped: controller consensus (TLS has since shipped) |
 | [SECURITY.md](SECURITY.md) | Reporting a vulnerability |
 
 ## Credits
